@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>주문하신 초밥 나왔습니다!</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #333;
+            font-family: 'Malgun Gothic', '맑은 고딕', sans-serif;
+            color: #fff;
+            overflow: hidden;
+        }
+        canvas {
+            background-color: #f0f0f0;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+        #game-container {
+            text-align: center;
+        }
+        h1 {
+            font-size: 2em;
+            color: #ffdd57;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <h1>주문하신 초밥 나왔습니다!</h1>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+</div>
+
+<script>
+// =================================================================================
+// GAME SETUP
+// =================================================================================
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+const HIGH_SCORE_KEY = 'sushiGameHighScore';
+
+// =================================================================================
+// WEB AUDIO API for SFX
+// =================================================================================
+const sfx = {
+    audioCtx: null,
+    init() {
+        // AudioContext is created on the first user interaction (click/keydown)
+        // to comply with browser autoplay policies.
+        if (!this.audioCtx) {
+            this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+    },
+    play(frequency, duration, type = 'sine', volume = 0.5) {
+        if (!this.audioCtx) return;
+        const oscillator = this.audioCtx.createOscillator();
+        const gainNode = this.audioCtx.createGain();
+
+        oscillator.connect(gainNode);
+        gainNode.connect(this.audioCtx.destination);
+
+        oscillator.type = type;
+        oscillator.frequency.setValueAtTime(frequency, this.audioCtx.currentTime);
+        gainNode.gain.setValueAtTime(volume, this.audioCtx.currentTime);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, this.audioCtx.currentTime + duration);
+
+        oscillator.start();
+        oscillator.stop(this.audioCtx.currentTime + duration);
+    },
+    // Intended Sound: A sharp, satisfying 'thwack'
+    placeIngredient() { this.play(440, 0.1, 'square', 0.4); },
+    // Intended Sound: A smooth 'whoosh'
+    serveSushi() { this.play(660, 0.15, 'sine', 0.5); },
+    // Intended Sound: A happy, ascending chime
+    orderSuccess() { this.play(523, 0.1); setTimeout(() => this.play(659, 0.1), 100); setTimeout(() => this.play(784, 0.15), 200); },
+    // Intended Sound: A sad, descending trombone 'womp womp'
+    orderFail() { this.play(220, 0.2, 'sawtooth'); setTimeout(() => this.play(196, 0.3, 'sawtooth'), 200); },
+    // Intended Sound: A powerful level-up sound
+    levelUp() { this.play(880, 0.05, 'triangle'); setTimeout(() => this.play(1046, 0.2, 'triangle'), 50); },
+};
+
+
+// =================================================================================
+// GAME OBJECTS & STATE
+// =================================================================================
+const Game = {
+    // Core State
+    state: 'START_SCREEN', // START_SCREEN, PHASE_1_MAKE, PHASE_2_SERVE, TRANSITION, GAME_OVER
+    score: 0,
+    highScore: 0,
+    failedOrders: 0,
+    maxFailedOrders: 3,
+
+    // Difficulty & Progression
+    difficulty: 1,
+    perfectCombo: 0,
+    isFeverTime: false,
+    feverTimer: 0,
+    FEVER_DURATION: 10, // seconds
+
+    // Phase 1: Making Sushi
+    ingredients: [
+        { name: '참치', color: '#ff4757' }, // Tuna
+        { name: '연어', color: '#ff7f50' }, // Salmon
+        { name: '계란', color: '#ffdd59' }, // Egg
+        { name: '새우', color: '#f7d794' }, // Shrimp
+        { name: '오이', color: '#2ed573' }, // Cucumber
+    ],
+    currentIngredient: null,
+    ingredientPos: { x: 0, y: 50, w: 70, h: 30 },
+    ingredientSpeed: 3,
+    ricePos: { x: canvas.width / 2 - 40, y: canvas.height - 120, w: 80, h: 30 },
+
+    // Phase 2: Serving Sushi
+    customers: [],
+    numCustomers: 6,
+    targetCustomerIndex: 0,
+    conveyorAngle: 0,
+    conveyorSpeed: 0.01,
+    handAngle: 0,
+    handSpeed: 0.03,
+    madeSushi: null,
+
+    // Orders
+    orderQueue: [],
+
+    // Visual Effects
+    particles: [],
+    textPopups: [],
+    screenShake: { intensity: 0, duration: 0 },
+
+    // Timing
+    lastTime: 0,
+    deltaTime: 0,
+    transitionTimer: 0,
+
+    // Methods
+    init() {
+        this.score = 0;
+        this.failedOrders = 0;
+        this.difficulty = 1;
+        this.perfectCombo = 0;
+        this.isFeverTime = false;
+        this.feverTimer = 0;
+        this.highScore = localStorage.getItem(HIGH_SCORE_KEY) || 0;
+        this.state = 'START_SCREEN';
+        this.orderQueue = [];
+        this.generateOrder();
+        this.generateOrder();
+        this.generateOrder();
+        this.setupCustomers();
+        this.startNewOrder();
+    },
+
+    startNewOrder() {
+        this.state = 'PHASE_1_MAKE';
+        this.currentIngredient = this.orderQueue.shift();
+        this.generateOrder();
+        this.ingredientPos.x = -this.ingredientPos.w;
+        this.ingredientSpeed = (3 + this.difficulty * 0.5) * (Math.random() > 0.5 ? 1 : -1);
+    },
+
+    generateOrder() {
+        const randomIndex = Math.floor(Math.random() * this.ingredients.length);
+        this.orderQueue.push(this.ingredients[randomIndex]);
+    },
+
+    setupCustomers() {
+        this.customers = [];
+        const radius = canvas.height * 0.35;
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2 + 30;
+        for (let i = 0; i < this.numCustomers; i++) {
+            const angle = (i / this.numCustomers) * Math.PI * 2;
+            this.customers.push({
+                x: centerX + Math.cos(angle) * radius,
+                y: centerY + Math.sin(angle) * radius,
+                angle: angle,
+                state: 'waiting' // waiting, happy, neutral
+            });
+        }
+    },
+
+    handleInput() {
+        sfx.init(); // Ensure AudioContext is ready
+
+        if (this.state === 'START_SCREEN' || this.state === 'GAME_OVER') {
+            this.init();
+            this.state = 'PHASE_1_MAKE';
+            return;
+        }
+
+        if (this.state === 'PHASE_1_MAKE') {
+            this.judgeMake();
+        } else if (this.state === 'PHASE_2_SERVE') {
+            this.judgeServe();
+        }
+    },
+
+    judgeMake() {
+        const riceCenterX = this.ricePos.x + this.ricePos.w / 2;
+        const ingredientCenterX = this.ingredientPos.x + this.ingredientPos.w / 2;
+        const distance = Math.abs(riceCenterX - ingredientCenterX);
+
+        if (this.currentIngredient.name !== this.orderQueue[0].name) {
+             // Wrong ingredient, but let's check if it's the one flying
+            const flyingIngredient = this.ingredients.find(ing => ing.name === this.currentIngredient.name);
+            if(flyingIngredient){
+                // This is a fail, but for the correct ingredient that was flying
+            } else {
+                 this.failOrder("Wrong Ingredient!");
+                 return;
+            }
+        }
+
+        if (distance < 10) { // Perfect
+            this.addScore(100);
+            this.addTextPopup('Perfect!', riceCenterX, this.ricePos.y, '#ffd700');
+            this.addParticles(riceCenterX, this.ricePos.y, 20, '#ffd700');
+            this.triggerScreenShake(5, 15);
+            sfx.placeIngredient();
+            this.madeSushi = { ...this.currentIngredient };
+            this.transitionToPhase2();
+        } else if (distance < 30) { // Good
+            this.addScore(50);
+            this.addTextPopup('Good', riceCenterX, this.ricePos.y, '#c0c0c0');
+            sfx.placeIngredient();
+            this.madeSushi = { ...this.currentIngredient };
+            this.transitionToPhase2();
+        } else { // Bad
+            this.failOrder("Bad timing!");
+        }
+    },
+
+    transitionToPhase2() {
+        this.state = 'TRANSITION';
+        this.transitionTimer = 1; // 1 second transition
+        this.targetCustomerIndex = Math.floor(Math.random() * this.numCustomers);
+        this.customers.forEach(c => c.state = 'waiting');
+        this.handAngle = Math.random() * Math.PI * 2;
+    },
+
+
+    judgeServe() {
+        const targetAngle = this.customers[this.targetCustomerIndex].angle;
+        let diff = Math.abs(this.handAngle - targetAngle);
+        if (diff > Math.PI) diff = 2 * Math.PI - diff; // Get shortest angle difference
+
+        const targetCustomer = this.customers[this.targetCustomerIndex];
+
+        if (diff < 0.1) { // Perfect
+            this.addScore(150);
+            this.perfectCombo++;
+            this.addTextPopup('오이시이!', targetCustomer.x, targetCustomer.y - 30, '#ff4757');
+            this.addParticles(targetCustomer.x, targetCustomer.y, 30, '#ff4757');
+            targetCustomer.state = 'happy';
+            sfx.orderSuccess();
+            if (this.perfectCombo > 0 && this.perfectCombo % 5 === 0) {
+                this.activateFever();
+            }
+        } else if (diff < 0.25) { // Good
+            this.addScore(70);
+            this.perfectCombo = 0;
+            this.addTextPopup('Good', targetCustomer.x, targetCustomer.y, '#c0c0c0');
+            targetCustomer.state = 'neutral';
+            sfx.serveSushi();
+        } else { // Bad
+            this.perfectCombo = 0;
+            this.addTextPopup('Miss...', canvas.width / 2, canvas.height / 2, '#888');
+            sfx.orderFail();
+        }
+        this.madeSushi = null;
+        this.startNewOrder();
+    },
+
+    failOrder(reason) {
+        this.addTextPopup(reason, canvas.width / 2, canvas.height / 2, '#ff0000');
+        this.addParticles(this.ingredientPos.x + this.ingredientPos.w / 2, this.ricePos.y, 30, '#58181F'); // Splat effect
+        sfx.orderFail();
+        this.perfectCombo = 0;
+        this.failedOrders++;
+        if (this.failedOrders >= this.maxFailedOrders) {
+            this.gameOver();
+        } else {
+            this.state = 'TRANSITION';
+            this.transitionTimer = 1.5; // Longer transition on fail
+            // After transition, a new order will start automatically
+        }
+    },
+    
+    gameOver() {
+        this.state = 'GAME_OVER';
+        if (this.score > this.highScore) {
+            this.highScore = this.score;
+            localStorage.setItem(HIGH_SCORE_KEY, this.score);
+        }
+    },
+
+    activateFever() {
+        if (this.isFeverTime) return; // Don't re-trigger if already active
+        this.isFeverTime = true;
+        this.feverTimer = this.FEVER_DURATION;
+        this.addTextPopup('PEAK TIME!', canvas.width / 2, canvas.height / 2, '#ff9f43', 3);
+        sfx.levelUp();
+    },
+
+    addScore(points) {
+        const finalPoints = this.isFeverTime ? points * 2 : points;
+        this.score += finalPoints;
+        this.difficulty = 1 + Math.floor(this.score / 500);
+    },
+
+    // VFX Helpers
+    addTextPopup(text, x, y, color, duration = 1) {
+        this.textPopups.push({ text, x, y, color, life: duration, initialY: y });
+    },
+    addParticles(x, y, count, color) {
+        for (let i = 0; i < count; i++) {
+            const angle = Math.random() * Math.PI * 2;
+            const speed = Math.random() * 3 + 1;
+            this.particles.push({
+                x, y,
+                vx: Math.cos(angle) * speed,
+                vy: Math.sin(angle) * speed,
+                life: Math.random() * 0.5 + 0.5,
+                color,
+                size: Math.random() * 3 + 2
+            });
+        }
+    },
+    triggerScreenShake(intensity, durationFrames) {
+        this.screenShake.intensity = intensity;
+        this.screenShake.duration = durationFrames;
+    },
+
+    // Main Loop Functions
+    update(deltaTime) {
+        if (this.state === 'START_SCREEN' || this.state === 'GAME_OVER') return;
+        
+        // Update timers
+        if(this.transitionTimer > 0) {
+            this.transitionTimer -= deltaTime;
+            if(this.transitionTimer <= 0) {
+                if (this.state === 'TRANSITION') {
+                    if (this.madeSushi) {
+                        this.state = 'PHASE_2_SERVE';
+                    } else {
+                        this.startNewOrder();
+                    }
+                }
+            }
+        }
+
+        if (this.isFeverTime) {
+            this.feverTimer -= deltaTime;
+            if (this.feverTimer <= 0) {
+                this.isFeverTime = false;
+                this.addTextPopup('Fever Over', canvas.width / 2, canvas.height / 2, '#fff', 2);
+            }
+        }
+        
+        // Update Game Objects based on state
+        if (this.state === 'PHASE_1_MAKE') {
+            const speedMultiplier = this.isFeverTime ? 0.8 : 1;
+            this.ingredientPos.x += this.ingredientSpeed * speedMultiplier;
+            if (this.ingredientPos.x > canvas.width || this.ingredientPos.x < -this.ingredientPos.w) {
+                this.ingredientSpeed *= -1;
+            }
+        }
+
+        if (this.state === 'PHASE_2_SERVE' || (this.state === 'TRANSITION' && this.madeSushi)) {
+            const speedMultiplier = this.isFeverTime ? 0.8 : 1;
+            this.conveyorAngle += (this.conveyorSpeed + this.difficulty * 0.002) * speedMultiplier;
+            this.handAngle += (this.handSpeed + this.difficulty * 0.005) * speedMultiplier;
+        }
+
+        // Update VFX
+        this.particles.forEach((p, i) => {
+            p.x += p.vx;
+            p.y += p.vy;
+            p.vy += 0.1; // gravity
+            p.life -= deltaTime;
+            if (p.life <= 0) this.particles.splice(i, 1);
+        });
+        this.textPopups.forEach((t, i) => {
+            t.y -= 1;
+            t.life -= deltaTime;
+            if (t.life <= 0) this.textPopups.splice(i, 1);
+        });
+        if (this.screenShake.duration > 0) {
+            this.screenShake.duration--;
+        } else {
+            this.screenShake.intensity = 0;
+        }
+    },
+
+    draw() {
+        // Apply screen shake
+        const shakeX = (Math.random() - 0.5) * this.screenShake.intensity;
+        const shakeY = (Math.random() - 0.5) * this.screenShake.intensity;
+        ctx.save();
+        ctx.translate(shakeX, shakeY);
+
+        // Clear canvas
+        ctx.fillStyle = this.isFeverTime ? '#6c5ce7' : '#82ccdd';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        if (this.state === 'START_SCREEN') {
+            this.drawStartScreen();
+        } else if (this.state === 'GAME_OVER') {
+            this.drawGameOverScreen();
+        } else {
+            // Draw common elements for all active game states
+            this.drawUI();
+
+            if (this.state === 'PHASE_1_MAKE' || (this.state === 'TRANSITION' && !this.madeSushi)) {
+                this.drawPhase1();
+            } else if (this.state === 'PHASE_2_SERVE' || (this.state === 'TRANSITION' && this.madeSushi)) {
+                this.drawPhase2();
+            }
+        }
+
+        // Draw VFX on top
+        this.drawParticles();
+        this.drawTextPopups();
+
+        ctx.restore(); // Restore context from screen shake
+    },
+
+    drawUI() {
+        // Score
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 24px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(`오늘의 매출: ${this.score}원`, 20, 40);
+
+        // High Score
+        ctx.textAlign = 'right';
+        ctx.fillText(`최고 매출: ${this.highScore}원`, canvas.width - 20, 40);
+
+        // Failed Orders (Lives)
+        ctx.textAlign = 'left';
+        for (let i = 0; i < this.maxFailedOrders; i++) {
+            ctx.fillStyle = i < this.failedOrders ? '#7f8fa6' : '#ff4757';
+            ctx.beginPath();
+            ctx.arc(35 + i * 30, 70, 10, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        // Combo
+        if (this.perfectCombo > 0) {
+            ctx.fillStyle = '#ffdd59';
+            ctx.font = 'bold 28px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText(`${this.perfectCombo} COMBO!`, canvas.width / 2, 80);
+        }
+
+        // Order Queue
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(canvas.width - 170, 60, 150, 130);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(canvas.width - 170, 60, 150, 130);
+        ctx.fillStyle = '#333';
+        ctx.font = '20px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('주문서', canvas.width - 95, 85);
+        this.orderQueue.slice(0, 3).forEach((order, i) => {
+            ctx.fillStyle = order.color;
+            ctx.fillRect(canvas.width - 160, 100 + i * 30, 20, 20);
+            ctx.fillStyle = '#333';
+            ctx.font = '16px sans-serif';
+            ctx.textAlign = 'left';
+            ctx.fillText(order.name, canvas.width - 130, 116 + i * 30);
+        });
+    },
+
+    drawPhase1() {
+        // Cutting Board (도마)
+        ctx.fillStyle = '#8a5a44';
+        ctx.fillRect(canvas.width / 2 - 150, canvas.height - 100, 300, 50);
+        ctx.fillStyle = '#6F4E37';
+        ctx.fillRect(canvas.width / 2 - 150, canvas.height - 100, 300, 10);
+
+        // Rice Ball (밥)
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.roundRect(this.ricePos.x, this.ricePos.y, this.ricePos.w, this.ricePos.h, [15]);
+        ctx.fill();
+        ctx.strokeStyle = '#ddd';
+        ctx.stroke();
+
+        // Moving Ingredient
+        const ingredient = this.currentIngredient;
+        ctx.fillStyle = ingredient.color;
+        ctx.beginPath();
+        ctx.roundRect(this.ingredientPos.x, this.ingredientPos.y, this.ingredientPos.w, this.ingredientPos.h, [10]);
+        ctx.fill();
+    },
+
+    drawPhase2() {
+        const centerX = canvas.width / 2;
+        const centerY = canvas.height / 2 + 30;
+        const radius = canvas.height * 0.35;
+
+        // Conveyor Belt
+        ctx.strokeStyle = '#7f8fa6';
+        ctx.lineWidth = 60;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.strokeStyle = '#c8d6e5';
+        ctx.lineWidth = 50;
+        ctx.beginPath();
+        ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // Customers
+        this.customers.forEach((customer, i) => {
+            const angle = customer.angle + this.conveyorAngle;
+            const x = centerX + Math.cos(angle) * radius;
+            const y = centerY + Math.sin(angle) * radius;
+            
+            // Body
+            ctx.fillStyle = '#ffb142';
+            ctx.beginPath();
+            ctx.arc(x, y, 20, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Eyes
+            ctx.fillStyle = '#3d3d3d';
+            if (customer.state === 'happy') { // Happy eyes
+                 ctx.beginPath();
+                 ctx.arc(x - 7, y - 2, 3, 0, Math.PI, true);
+                 ctx.arc(x + 7, y - 2, 3, 0, Math.PI, true);
+                 ctx.lineWidth = 2;
+                 ctx.stroke();
+            } else { // Normal eyes
+                ctx.beginPath();
+                ctx.arc(x - 6, y - 3, 3, 0, Math.PI * 2);
+                ctx.arc(x + 6, y - 3, 3, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // Target indicator
+            if (i === this.targetCustomerIndex) {
+                ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+                ctx.beginPath();
+                ctx.roundRect(x - 40, y - 65, 80, 30, [10]);
+                ctx.fill();
+                ctx.beginPath();
+                ctx.moveTo(x, y - 35);
+                ctx.lineTo(x-10, y-40);
+                ctx.lineTo(x+10, y-40);
+                ctx.fill();
+
+                ctx.fillStyle = '#333';
+                ctx.font = 'bold 18px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText(this.madeSushi.name, x, y - 45);
+            }
+        });
+
+        // Hand with sushi
+        const handX = centerX + Math.cos(this.handAngle) * 50;
+        const handY = centerY + Math.sin(this.handAngle) * 50;
+        // Arm
+        ctx.strokeStyle = '#feca57';
+        ctx.lineWidth = 15;
+        ctx.beginPath();
+        ctx.moveTo(centerX, centerY);
+        ctx.lineTo(handX, handY);
+        ctx.stroke();
+        // Plate
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(handX, handY, 25, 0, Math.PI * 2);
+        ctx.fill();
+        // Sushi on plate
+        ctx.fillStyle = this.madeSushi.color;
+        ctx.beginPath();
+        ctx.roundRect(handX - 20, handY - 10, 40, 20, [8]);
+        ctx.fill();
+    },
+
+    drawParticles() {
+        this.particles.forEach(p => {
+            ctx.fillStyle = p.color;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+            ctx.fill();
+        });
+    },
+
+    drawTextPopups() {
+        this.textPopups.forEach(t => {
+            const alpha = t.life / 1; // Fade out
+            ctx.fillStyle = t.color;
+            ctx.font = 'bold 32px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.globalAlpha = Math.max(0, alpha);
+            ctx.fillText(t.text, t.x, t.y);
+            ctx.globalAlpha = 1.0;
+        });
+    },
+
+    drawStartScreen() {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 48px sans-serif';
+        ctx.fillText('주문하신 초밥 나왔습니다!', canvas.width / 2, canvas.height / 2 - 60);
+        ctx.font = '32px sans-serif';
+        ctx.fillText('Click or Press Space to Start', canvas.width / 2, canvas.height / 2 + 20);
+        ctx.font = '24px sans-serif';
+        ctx.fillText(`최고 매출: ${this.highScore}원`, canvas.width / 2, canvas.height / 2 + 80);
+    },
+
+    drawGameOverScreen() {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#ff4757';
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 48px sans-serif';
+        ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2 - 80);
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = '32px sans-serif';
+        ctx.fillText(`오늘의 매출: ${this.score}원`, canvas.width / 2, canvas.height / 2);
+
+        if (this.score > 0 && this.score === this.highScore) {
+             ctx.fillStyle = '#ffdd59';
+             ctx.fillText('New High Score!', canvas.width / 2, canvas.height / 2 + 40);
+        } else {
+             ctx.fillStyle = '#fff';
+             ctx.fillText(`최고 매출: ${this.highScore}원`, canvas.width / 2, canvas.height / 2 + 40);
+        }
+        
+        ctx.fillStyle = '#fff';
+        ctx.font = '24px sans-serif';
+        ctx.fillText('Click or Press Space to Restart', canvas.width / 2, canvas.height / 2 + 120);
+    }
+};
+
+// =================================================================================
+// GAME LOOP
+// =================================================================================
+function gameLoop(timestamp) {
+    if (!Game.lastTime) {
+        Game.lastTime = timestamp;
+    }
+    Game.deltaTime = (timestamp - Game.lastTime) / 1000;
+    Game.lastTime = timestamp;
+
+    Game.update(Game.deltaTime);
+    Game.draw();
+
+    requestAnimationFrame(gameLoop);
+}
+
+// =================================================================================
+// EVENT LISTENERS
+// =================================================================================
+function handleUserAction(event) {
+    // Prevent spacebar from scrolling the page
+    if (event.code === 'Space') {
+        event.preventDefault();
+    }
+    Game.handleInput();
+}
+window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') handleUserAction(e);
+});
+canvas.addEventListener('click', handleUserAction);
+
+
+// =================================================================================
+// START GAME
+// =================================================================================
+Game.init();
+requestAnimationFrame(gameLoop);
+
+</script>
+</body>
+</html>
